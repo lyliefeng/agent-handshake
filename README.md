@@ -10,28 +10,13 @@
 
 ## 安装
 
-本 Skill 可安装到任何支持 Skill 机制的 AI 智能体平台（WorkBuddy、CodeBuddy、OpenCode、ClawHub 等）。
-
-### Git 安装（通用）
+本 Skill 可安装到任何支持 Skill 机制的 AI 智能体平台。
 
 ```bash
-git clone https://github.com/lyliefeng/agent-handshake.git ~/.workbuddy/skills/agent-handshake
+git clone https://github.com/lyliefeng/agent-handshake.git <平台 Skill 目录>
 ```
 
-克隆到对应平台的 Skill 目录即可：
-
-| 平台 | Skill 目录 |
-|---|---|
-| WorkBuddy | `~/.workbuddy/skills/` |
-| CodeBuddy | `~/.codebuddy/skills/` |
-| 其他平台 | 参照对应平台的 Skill 目录规范 |
-
-### 平台市场安装
-
-上架后可在各平台市场搜索 `agent-handshake` 一键安装：
-
-- **ClawHub**: `clawhub install agent-handshake` 或 https://clawhub.ai
-- **SkillHub**: 在 WorkBuddy/CodeBuddy 对话中直接说 `安装 agent-handshake 技能`
+平台市场搜索 `agent-handshake` 亦可一键安装。
 
 ---
 
