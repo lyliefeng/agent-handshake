@@ -14,6 +14,33 @@
 
 `agent-handshake` 就是这个通道。
 
+## 前置条件
+
+**本 Skill 是握手连接器，不是 AI Agent 本身。** 使用前，你需要在自己的服务器上先部署一个 AI Agent。
+
+### 推荐：OpenCode CLI
+
+最轻量的选择，内置 Zen 免费模型（零 API Key、零费用），一条命令安装：
+
+```bash
+curl -fsSL https://opencode.ai/install | bash
+```
+
+装完即可运行 `opencode serve`，本 Skill 自动发现并握手。
+
+### 其他兼容 Agent
+
+只要你的 Agent 提供 `GET /health` 端点（返回 HTTP 200 + JSON），就能被自动发现：
+
+| Agent | 安装方式 | 端口 |
+|---|---|---|
+| OpenCode CLI | `curl -fsSL https://opencode.ai/install \| bash` | 4096 |
+| LangChain (LangServe) | `pip install langserve && uvicorn app:app` | 8000 |
+| CrewAI | `pip install crewai && crewai serve` | 8000 |
+| 自建 FastAPI Agent | 任意 Python/Node.js HTTP 服务 | 任意 |
+
+> 不限制 Agent 类型——只要它能通过 HTTP 接收任务并执行，`agent-handshake` 就能发现、注册、握手。
+
 ```
 Mac (本地智能体)                         NAS (OpenCode Serve)
   │  HTTP 握手 ──────────────────────────→  读文件 / 跑命令 / AI 推理
