@@ -1,136 +1,243 @@
 #!/bin/bash
-# OpenCode 快速握手 — 本地侧接受服务器身份牌
-# 接收 register.sh 生成的身份 JSON，验证可达性，保存到 skill 记忆
-# 用法: accept.sh < <identity.json>
-#       accept.sh <server-hostname> <address> [auth]
+# Agent Handshake — accept and persist a server identity.
+# Usage: accept.sh <hostname> <address> [auth] [protocol]
+#        cat identity.json | accept.sh
 set -euo pipefail
 
-SKILL_DIR="${OPENCODE_SKILL_DIR:-$(dirname "$(dirname "$(realpath "$0")")")}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CLIENT="$SCRIPT_DIR/handshake_client.py"
+SKILL_DIR="${OPENCODE_SKILL_DIR:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}"
 SERVERS_DIR="$SKILL_DIR/references/servers"
+CONFIG_FILE="${AGENT_HANDSHAKE_CONFIG:-$HOME/.agent-handshake}"
+AUTH="${OPENCODE_AUTH:-}"
 mkdir -p "$SERVERS_DIR"
-AUTH="${OPENCODE_AUTH:-opencode:opencode123}"
 
-IDENTITY=""
-HOSTNAME=""
-ADDRESS=""
+if [ "$#" -gt 4 ]; then
+    echo "用法: accept.sh <hostname> <address> [auth] [protocol]" >&2
+    exit 2
+fi
 
-# ── 解析输入 ──
-if [ $# -ge 2 ]; then
-    # 快捷模式: accept.sh <hostname> <address> [auth]
+validate_hostname() {
+    case "$HOSTNAME" in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "❌ 非法主机名: $HOSTNAME" >&2
+            exit 2
+            ;;
+    esac
+}
+
+if [ "$#" -ge 2 ]; then
     HOSTNAME="$1"
+    validate_hostname
     ADDRESS="${2%/}"
     [ -n "${3:-}" ] && AUTH="$3"
-    
-    # 验证可达性
-    echo "▸ 验证 $ADDRESS ..."
-    if ! curl -sf --max-time 5 -u "$AUTH" "$ADDRESS/global/health" > /dev/null 2>&1; then
-        echo "  ❌ $ADDRESS 不可达"
-        exit 1
-    fi
-    
-    # 采集送达服务器的信息
-    SERVE_VER=$(curl -sf --max-time 5 -u "$AUTH" "$ADDRESS/global/health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','?'))" 2>/dev/null || echo "?")
-    
-    # 构建简化身份牌
-    IDENTITY=$(python3 -c "
-import json
-identity = {
-    'hostname': '$HOSTNAME',
-    'address': '$ADDRESS',
-    'port': ${ADDRESS##*:},
-    'opencode': {
-        'serve_version': '$SERVE_VER',
-        'serve_running': True
-    },
-    'accepted_at': '$(date '+%Y-%m-%d %H:%M:%S %Z')',
-    'accepted_unix': $(date +%s)
-}
-print(json.dumps(identity, ensure_ascii=False, indent=2))
-")
+    PROTOCOL_HINT="${4:-}"
+    IDENTITY_JSON=""
 else
-    # 完整模式: 从 stdin 读取 register.sh 输出的 JSON
-    IDENTITY=$(cat)
-    HOSTNAME=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hostname','unknown'))" 2>/dev/null || echo "unknown")
-    
-    # 从身份牌提取最佳地址验证
-    ADDRESS=""
-    for ip in $(echo "$IDENTITY" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-ips = d.get('network',{}).get('lan_ips',[])
-for ip in ips:
-    print(ip)
-" 2>/dev/null); do
-        PORT="${OPENCODE_PORT:-4096}"
-        if curl -sf --max-time 3 -u "$AUTH" "http://$ip:$PORT/global/health" > /dev/null 2>&1; then
-            ADDRESS="http://$ip:$PORT"
+    IDENTITY_JSON="$(cat)"
+    HOSTNAME="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("hostname", "unknown"))')"
+    validate_hostname
+    PROTOCOL_HINT="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("agent_type", ""))')"
+    [ -n "$AUTH" ] || AUTH="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("auth", ""))')"
+    ADDRESS="$(IDENTITY_JSON="$IDENTITY_JSON" python3 - "${OPENCODE_PORT:-4096}" <<'PY'
+import json
+import os
+import sys
+
+data = json.loads(os.environ["IDENTITY_JSON"])
+network = data.get("network", {})
+port = str(data.get("opencode", {}).get("serve_port") or sys.argv[1] or "4096")
+addresses = []
+if isinstance(data.get("address"), str) and data["address"].strip():
+    addresses.append(data["address"].strip().rstrip("/"))
+for ip in network.get("lan_ips", []):
+    addresses.append("http://{}:{}".format(ip, port))
+if network.get("public_ip"):
+    addresses.append("http://{}:{}".format(network["public_ip"], port))
+tunnel = data.get("tunnel") or {}
+if tunnel.get("url"):
+    addresses.insert(0, tunnel["url"].rstrip("/"))
+print("\n".join(dict.fromkeys(addresses)))
+PY
+    )"
+    ADDRESS="$(printf '%s\n' "$ADDRESS" | while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        if python3 "$CLIENT" probe --address "$candidate" --auth "$AUTH" --protocol "$PROTOCOL_HINT" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
             break
         fi
-    done
-    
-    if [ -z "$ADDRESS" ]; then
-        echo "  ❌ 无法连接到 $HOSTNAME 的任何 IP"
-        echo "  (请确认 OpenCode Serve 在运行且网络可达)"
+    done | head -1)"
+    [ -n "$ADDRESS" ] || {
+        echo "❌ 无法连接到 $HOSTNAME 的任何已记录地址" >&2
         exit 1
-    fi
+    }
 fi
 
-# ── 保存身份牌到 skill 记忆 ──
+echo "▸ 验证 $ADDRESS ..."
+PROBE_ARGS=(probe --address "$ADDRESS" --auth "$AUTH")
+[ -n "$PROTOCOL_HINT" ] && PROBE_ARGS+=(--protocol "$PROTOCOL_HINT")
+if ! PROBE_JSON="$(python3 "$CLIENT" "${PROBE_ARGS[@]}" 2>&1)"; then
+    echo "  ❌ 地址验证失败"
+    echo "     $PROBE_JSON"
+    exit 1
+fi
+
+NORMALIZED_ADDRESS="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["address"])')"
+PROTOCOL="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocol", "generic"))')"
+VERSION="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", "?"))')"
+
+case "$AUTH$NORMALIZED_ADDRESS$PROTOCOL" in
+    *$'\n'*|*$'\r'*)
+        echo "❌ 配置值不能包含换行" >&2
+        exit 2
+        ;;
+esac
+
+if [ -z "$IDENTITY_JSON" ]; then
+    IDENTITY_JSON="$(python3 - "$HOSTNAME" "$NORMALIZED_ADDRESS" "$PROTOCOL" "$VERSION" <<'PY'
+import json
+import sys
+from datetime import datetime
+
+hostname, address, protocol, version = sys.argv[1:]
+print(json.dumps({
+    "hostname": hostname,
+    "address": address,
+    "protocol": protocol,
+    "opencode": {"serve_version": version, "serve_running": True},
+    "accepted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+}, ensure_ascii=False, indent=2))
+PY
+    )"
+else
+    IDENTITY_JSON="$(IDENTITY_JSON="$IDENTITY_JSON" python3 - "$NORMALIZED_ADDRESS" "$PROTOCOL" "$VERSION" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime
+
+data = json.loads(os.environ["IDENTITY_JSON"])
+verified_address, verified_protocol, verified_version = sys.argv[1:]
+reported_address = data.get("address")
+if reported_address and reported_address != verified_address:
+    data["reported_address"] = reported_address
+reported_protocol = data.get("protocol")
+if reported_protocol and reported_protocol != verified_protocol:
+    data["reported_protocol"] = reported_protocol
+data["address"] = verified_address
+data["protocol"] = verified_protocol
+data.setdefault("opencode", {})
+reported_version = data["opencode"].get("serve_version")
+if reported_version and reported_version != verified_version:
+    data["opencode"]["reported_serve_version"] = reported_version
+data["opencode"]["serve_version"] = verified_version
+data.setdefault("accepted_at", datetime.now().astimezone().isoformat(timespec="seconds"))
+print(json.dumps(data, ensure_ascii=False, indent=2))
+PY
+    )"
+fi
+
+OLD_UMASK="$(umask)"
+umask 077
 IDENTITY_FILE="$SERVERS_DIR/$HOSTNAME.json"
-echo "$IDENTITY" > "$IDENTITY_FILE"
+SAVED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+ACCEPT_IDENTITY_JSON="$IDENTITY_JSON" \
+ACCEPT_ADDRESS="$NORMALIZED_ADDRESS" \
+ACCEPT_AUTH="$AUTH" \
+ACCEPT_PROTOCOL="$PROTOCOL" \
+ACCEPT_HOSTNAME="$HOSTNAME" \
+ACCEPT_VERSION="$VERSION" \
+ACCEPT_SAVED_AT="$SAVED_AT" \
+python3 - "$IDENTITY_FILE" "$CONFIG_FILE" <<'PY'
+import os
+import sys
+import tempfile
 
-# ── 同时保存到全局配置（跨 skill 使用） ──
-CONFIG_FILE="$HOME/.agent-handshake"
-if [ -n "$ADDRESS" ]; then
-    cat > "$CONFIG_FILE" << CFGEOF
-# OpenCode 快速握手配置（由 accept.sh 自动生成）
-ADDRESS=$ADDRESS
-AUTH=$AUTH
-HOSTNAME=$HOSTNAME
-SAVED_AT=$(date '+%Y-%m-%d %H:%M:%S')
-CFGEOF
-fi
+identity_path, config_path = sys.argv[1:]
 
-# ── 更新服务器索引 ──
-INDEX_FILE="$SERVERS_DIR/_index.json"
-python3 -c "
-import json, os, glob
-
-servers = {}
-for f in sorted(glob.glob('$SERVERS_DIR/*.json')):
-    if os.path.basename(f).startswith('_'): continue
+def atomic_write(path, content):
+    directory = os.path.dirname(path) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".agent-handshake.", dir=directory, text=True)
     try:
-        with open(f) as fh:
-            data = json.load(fh)
-        hn = data.get('hostname', os.path.basename(f).replace('.json',''))
-        servers[hn] = {
-            'hostname': hn,
-            'address': data.get('address', ''),
-            'version': data.get('opencode',{}).get('serve_version','?'),
-            'accepted_at': data.get('accepted_at',''),
-            'file': os.path.basename(f)
-        }
-    except: pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
-with open('$INDEX_FILE', 'w') as f:
-    json.dump({'servers': servers, 'total': len(servers)}, f, ensure_ascii=False, indent=2)
+atomic_write(identity_path, os.environ["ACCEPT_IDENTITY_JSON"].rstrip("\n") + "\n")
+config = "\n".join([
+    "# Agent Handshake configuration",
+    "ADDRESS=" + os.environ["ACCEPT_ADDRESS"],
+    "AUTH=" + os.environ["ACCEPT_AUTH"],
+    "PROTOCOL=" + os.environ["ACCEPT_PROTOCOL"],
+    "HOSTNAME=" + os.environ["ACCEPT_HOSTNAME"],
+    "SAVED_AT=" + os.environ["ACCEPT_SAVED_AT"],
+    "VERSION=" + os.environ["ACCEPT_VERSION"],
+    "",
+])
+atomic_write(config_path, config)
+PY
+umask "$OLD_UMASK"
 
-with open('$INDEX_FILE') as f:
-    print(f.read())
-" 2>/dev/null
+INDEX_FILE="$SERVERS_DIR/_index.json"
+python3 - "$SERVERS_DIR" "$INDEX_FILE" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+servers_dir = Path(sys.argv[1])
+index_file = Path(sys.argv[2])
+servers = {}
+for path in sorted(servers_dir.glob("*.json")):
+    if path.name.startswith("_"):
+        continue
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        continue
+    hostname = data.get("hostname", path.stem)
+    servers[hostname] = {
+        "hostname": hostname,
+        "address": data.get("address", ""),
+        "protocol": data.get("protocol", data.get("agent_type", "generic")),
+        "version": data.get("opencode", {}).get("serve_version", data.get("version", "?")),
+        "accepted_at": data.get("accepted_at", ""),
+        "file": path.name,
+    }
+payload = json.dumps({"servers": servers, "total": len(servers)}, ensure_ascii=False, indent=2) + "\n"
+fd, temporary = tempfile.mkstemp(prefix=".agent-index.", dir=str(index_file.parent), text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, index_file)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+PY
+chmod 600 "$INDEX_FILE" "$IDENTITY_FILE"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ✅ 服务器已接受并存入 skill 记忆"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  主机名:   $HOSTNAME"
-echo "  地址:     $ADDRESS"
+echo "  地址:     $NORMALIZED_ADDRESS"
+echo "  协议:     $PROTOCOL v$VERSION"
 echo "  身份牌:   $IDENTITY_FILE"
-echo "  全局配置: $CONFIG_FILE"
-echo ""
-echo "  ▸ 已知服务器列表: $SERVERS_DIR/"
-echo "  ▸ 索引文件:       $SERVERS_DIR/_index.json"
+echo "  全局配置: $CONFIG_FILE (0600)"
 echo ""
 echo "  现在可以一键握手:"
-echo "  handshake.sh auto \"你的问题\""
+echo "  bash scripts/handshake.sh auto \"你的问题\""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

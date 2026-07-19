@@ -1,2 +1,4 @@
 # 排除所有服务器信息（含 IP/认证）
 references/servers/
+__pycache__/
+*.py[cod]

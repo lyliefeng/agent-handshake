@@ -1,165 +1,202 @@
 #!/bin/bash
-# OpenCode 快速握手 — 执行握手的核心脚本
-# 用法: handshake.sh [address] [message]
-#        handshake.sh http://192.168.5.2:4096 "帮我查磁盘"
-#        handshake.sh auto "直接握手"     ← auto 模式自动选地址
+# Agent Handshake — probe and execute a task against a remote agent.
+# Usage: handshake.sh [address|auto] [message]
 set -euo pipefail
 
-ADDRESS="${1:-auto}"
-MESSAGE="${2:-握手测试：你好，请用中文回复一个字}"
-
-# ── auth 认证 ──
-AUTH="${OPENCODE_AUTH:-opencode:opencode123}"
-
-# ── auto 模式：自动选最优地址 ──
-if [ "$ADDRESS" = "auto" ]; then
-    # 优先用已保存配置
-    if [ -f ~/.agent-handshake ]; then
-        ADDRESS=$(grep -oP 'ADDRESS=\K.*' ~/.agent-handshake 2>/dev/null | head -1 || echo "")
-        [ -n "$ADDRESS" ] && echo "📄 使用已保存配置: $ADDRESS"
-    fi
-    # 其次公网
-    if [ -z "$ADDRESS" ] || ! curl -sf --max-time 3 "$ADDRESS/global/health" > /dev/null 2>&1; then
-        ADDRESS=$(python3 -c "
-import json
-try:
-    with open('/tmp/opencode-discover.json') as f:
-        data = json.load(f)
-    if data.get('public',{}).get('reachable'):
-        print('http://{}:{}'.format(data['public']['ip'], data['public']['port']))
-    elif len(data.get('lan',[])) > 0:
-        print('http://{}'.format(data['lan'][0]['addr']))
-    elif data.get('local',{}).get('reachable'):
-        print('http://127.0.0.1:{}'.format(data['local']['port']))
-except: pass
-" 2>/dev/null || echo "")
-        [ -n "$ADDRESS" ] && echo "🔍 自动发现: $ADDRESS"
-    fi
-    # 最后用已知的默认地址
-    [ -z "$ADDRESS" ] && ADDRESS="http://192.168.5.2:4096"
-fi
-
-# ── 清理地址（去掉末尾斜杠） ──
-ADDRESS="${ADDRESS%/}"
-
-# ── 握手三部曲 ──
-# ── 查 skill 记忆中的服务器身份 ──
-SKILL_DIR="${OPENCODE_SKILL_DIR:-$(dirname "$(dirname "$(realpath "$0")")")}"
-SERVERS_DIR="$SKILL_DIR/references/servers"
-SERVER_IDENTITY=""
-
-# 从地址提取 IP
-HANDLE_IP=$(echo "$ADDRESS" | sed 's|https\?://||' | cut -d: -f1)
-
-# 遍历已知服务器，匹配 IP
-if [ -d "$SERVERS_DIR" ]; then
-    for f in "$SERVERS_DIR"/*.json; do
-        [ ! -f "$f" ] && continue
-        [ "$(basename "$f")" = "_index.json" ] && continue
-        # 检查该服务器的 LAN IP 列表是否包含握手 IP
-        MATCH=$(python3 -c "
-import json, sys
-with open('$f') as fh:
-    d = json.load(fh)
-ips = d.get('network',{}).get('lan_ips',[]) + ([d['network']['public_ip']] if d.get('network',{}).get('public_ip') else [])
-if '$HANDLE_IP' in ips:
-    print(d.get('hostname',''))
-" 2>/dev/null || echo "")
-        if [ -n "$MATCH" ]; then
-            SERVER_IDENTITY=$(python3 -c "import json; print(json.dumps(json.load(open('$f')), ensure_ascii=False))" 2>/dev/null || echo "{}")
-            break
-        fi
-    done
-fi
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  🔗 OpenCode 快速握手"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-# 判断地址类型
-if echo "$ADDRESS" | grep -q "trycloudflare\.com"; then
-    echo "  🌍 隧道: $ADDRESS (Cloudflare)"
-elif echo "$ADDRESS" | grep -q "^https\?://\([0-9]\{1,3\}\.\)\{3\}"; then
-    if echo "$ADDRESS" | grep -q "192\.168\|10\.\|172\.\(1[6-9]\|2[0-9]\|3[01]\)"; then
-        echo "  🏠 局域网: $ADDRESS"
-    else
-        echo "  🌍 公网: $ADDRESS"
-    fi
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CLIENT="$SCRIPT_DIR/handshake_client.py"
+if [ -n "${AGENT_HANDSHAKE_CONFIG:-}" ]; then
+    CONFIG_FILE="$AGENT_HANDSHAKE_CONFIG"
+elif [ -f "$HOME/.agent-handshake" ]; then
+    CONFIG_FILE="$HOME/.agent-handshake"
+elif [ -f "$HOME/.opencode-handshake" ]; then
+    CONFIG_FILE="$HOME/.opencode-handshake"
 else
-    echo "  🔗 地址: $ADDRESS"
+    CONFIG_FILE="$HOME/.agent-handshake"
 fi
+DISCOVER_FILE="${OPENCODE_DISCOVER_FILE:-/tmp/opencode-discover.json}"
+
+REQUESTED_ADDRESS="${1:-auto}"
+ADDRESS="$REQUESTED_ADDRESS"
+MESSAGE="${2:-握手测试：你好，请用中文回复一个字}"
+EXPLICIT_AUTH="${OPENCODE_AUTH:-}"
+EXPLICIT_PROTOCOL="${OPENCODE_PROTOCOL:-}"
+DISCOVERY_AUTH="${OPENCODE_DISCOVERY_AUTH:-}"
+AUTH="$EXPLICIT_AUTH"
+PROTOCOL="$EXPLICIT_PROTOCOL"
+PROVIDER="${OPENCODE_PROVIDER:-}"
+MODEL="${OPENCODE_MODEL:-}"
+TIMEOUT="${OPENCODE_HANDSHAKE_TIMEOUT:-120}"
+SAVED_ADDRESS=""
+SAVED_AUTH=""
+SAVED_PROTOCOL=""
+
+read_config_value() {
+    local key="$1"
+    [ -f "$CONFIG_FILE" ] || return 0
+    sed -n "s/^${key}=//p" "$CONFIG_FILE" | head -1
+}
+
+if [ "$REQUESTED_ADDRESS" = "auto" ] && [ -f "$CONFIG_FILE" ]; then
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    SAVED_ADDRESS="$(read_config_value ADDRESS)"
+    SAVED_AUTH="$(read_config_value AUTH)"
+    SAVED_PROTOCOL="$(read_config_value PROTOCOL)"
+    if [ -n "$SAVED_ADDRESS" ]; then
+        ADDRESS="$SAVED_ADDRESS"
+    fi
+fi
+
+discovery_candidates() {
+    [ -f "$DISCOVER_FILE" ] || return 0
+    python3 - "$DISCOVER_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+
+addresses = []
+public = data.get("public", {})
+if public.get("reachable") and public.get("ip"):
+    addresses.append(("http://{}:{}".format(public["ip"], public.get("port", 4096)), ""))
+
+for item in data.get("lan", []):
+    address = item.get("addr") or item.get("address")
+    if address:
+        if not address.startswith(("http://", "https://")):
+            address = "http://" + address
+        addresses.append((address, str(item.get("protocol", ""))))
+
+local = data.get("local", {})
+if local.get("reachable"):
+    addresses.append(("http://127.0.0.1:{}".format(local.get("port", 4096)), ""))
+
+seen = set()
+for address, protocol in addresses:
+    key = (address, protocol)
+    if key in seen:
+        continue
+    seen.add(key)
+    print("{}\t{}".format(address, protocol))
+PY
+}
+
+probe_address() {
+    local candidate="$1"
+    local probe_args=(probe --address "$candidate" --auth "$AUTH")
+    [ -n "$PROTOCOL" ] && probe_args+=(--protocol "$PROTOCOL")
+    python3 "$CLIENT" "${probe_args[@]}"
+}
+
+PROBE_JSON=""
+LAST_PROBE_ERROR=""
+
+try_address() {
+    local candidate="$1"
+    local candidate_auth="${2:-}"
+    local candidate_protocol="${3:-}"
+    local probe_output=""
+    local old_auth="$AUTH"
+    local old_protocol="$PROTOCOL"
+    AUTH="$candidate_auth"
+    PROTOCOL="$candidate_protocol"
+    if probe_output="$(probe_address "$candidate" 2>&1)"; then
+        ADDRESS="$candidate"
+        PROBE_JSON="$probe_output"
+        return 0
+    fi
+    AUTH="$old_auth"
+    PROTOCOL="$old_protocol"
+    LAST_PROBE_ERROR="$probe_output"
+    return 1
+}
+
+probe_protocol() {
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocol", "generic"))'
+}
+
+if [ "$REQUESTED_ADDRESS" != "auto" ]; then
+    try_address "$ADDRESS" "$EXPLICIT_AUTH" "$EXPLICIT_PROTOCOL" || true
+else
+    if [ "$ADDRESS" != "auto" ]; then
+        echo "📄 尝试已保存配置: $ADDRESS"
+        SAVED_TRY_AUTH="$EXPLICIT_AUTH"
+        [ -n "$SAVED_TRY_AUTH" ] || SAVED_TRY_AUTH="$SAVED_AUTH"
+        SAVED_TRY_PROTOCOL="$EXPLICIT_PROTOCOL"
+        [ -n "$SAVED_TRY_PROTOCOL" ] || SAVED_TRY_PROTOCOL="$SAVED_PROTOCOL"
+        try_address "$ADDRESS" "$SAVED_TRY_AUTH" "$SAVED_TRY_PROTOCOL" || true
+        if [ -n "$PROBE_JSON" ] && [ "$(probe_protocol "$PROBE_JSON")" = "mcp" ]; then
+            echo "⚠️ 已保存地址仅提供 MCP 健康发现，跳过自然语言任务"
+            LAST_PROBE_ERROR="MCP endpoint is discovery-only"
+            PROBE_JSON=""
+        fi
+    fi
+    if [ -z "$PROBE_JSON" ]; then
+        while IFS=$'\t' read -r discovered discovered_protocol; do
+            [ -n "$discovered" ] || continue
+            [ "$discovered" = "$ADDRESS" ] && continue
+            echo "🔍 尝试发现地址: $discovered"
+            CANDIDATE_PROTOCOL="$discovered_protocol"
+            [ -n "$CANDIDATE_PROTOCOL" ] || CANDIDATE_PROTOCOL="$EXPLICIT_PROTOCOL"
+            if try_address "$discovered" "$DISCOVERY_AUTH" "$CANDIDATE_PROTOCOL"; then
+                if [ "$(probe_protocol "$PROBE_JSON")" = "mcp" ]; then
+                    echo "⚠️ 跳过 MCP 健康发现候选: $discovered"
+                    LAST_PROBE_ERROR="MCP endpoint is discovery-only"
+                    PROBE_JSON=""
+                    continue
+                fi
+                break
+            fi
+        done < <(discovery_candidates 2>/dev/null || true)
+    fi
+fi
+
+if [ -z "${PROBE_JSON:-}" ]; then
+    if [ "$REQUESTED_ADDRESS" = "auto" ] && [ "$ADDRESS" = "auto" ]; then
+        echo "❌ 没有可用地址；请先运行 discover.sh 或指定 address" >&2
+    else
+        echo "❌ 握手失败：$ADDRESS 不可达或协议不兼容" >&2
+    fi
+    [ -n "$LAST_PROBE_ERROR" ] && echo "   $LAST_PROBE_ERROR" >&2
+    exit 1
+fi
+
+NEGOTIATED="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocol", "generic"))')"
+VERSION="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", "?"))')"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🔗 Agent 快速握手"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  地址: $ADDRESS"
+echo "  协议: $NEGOTIATED"
+echo "  版本: $VERSION"
 echo "  消息: $MESSAGE"
-
-# 展示匹配到的服务器身份
-if [ -n "$SERVER_IDENTITY" ] && [ "$SERVER_IDENTITY" != "{}" ]; then
-    echo "$SERVER_IDENTITY" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(f'  主机: {d[\"hostname\"]}  {d.get(\"os\",\"?\")} ({d.get(\"kernel\",\"?\")})')
-print(f'  配置: {d.get(\"cpu\",\"?\")} | 内存 {d.get(\"memory\",\"?\")}')
-oc = d.get('opencode', {})
-print(f'  OpenCode: {oc.get(\"serve_version\",\"?\")} (serve端口:{oc.get(\"serve_port\",\"?\")})')
-print(f'  SSH: {d.get(\"ssh_fingerprint\",\"?\")[:20]}')
-" 2>/dev/null
-fi
 echo ""
+echo "  ✓ 服务在线"
 
-# ① 健康检查
-if ! curl -sf --max-time 5 -u "$AUTH" "$ADDRESS/global/health" > /dev/null 2>&1; then
-    echo "  ❌ 握手失败: OpenCode 服务不可达"
-    echo "     请确认 $ADDRESS 上 OpenCode serve 正在运行"
+if { [ -n "$PROVIDER" ] && [ -z "$MODEL" ]; } || { [ -z "$PROVIDER" ] && [ -n "$MODEL" ]; }; then
+    echo "❌ OPENCODE_PROVIDER 和 OPENCODE_MODEL 必须同时设置" >&2
+    exit 2
+fi
+
+RUN_ARGS=(run --address "$ADDRESS" --message "$MESSAGE" --auth "$AUTH" --timeout "$TIMEOUT")
+[ -n "$PROVIDER" ] && RUN_ARGS+=(--provider "$PROVIDER" --model "$MODEL")
+[ -n "$PROTOCOL" ] && RUN_ARGS+=(--protocol "$PROTOCOL")
+if ! RESULT_JSON="$(python3 "$CLIENT" "${RUN_ARGS[@]}" 2>&1)"; then
+    echo "  ❌ 任务执行失败"
+    echo "     $RESULT_JSON"
     exit 1
 fi
 
-VER=$(curl -sf --max-time 5 -u "$AUTH" "$ADDRESS/global/health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','?'))" 2>/dev/null || echo "?")
-echo "  ✓ 服务在线 (v$VER)"
+REPLY="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reply", ""))')"
+SESSION_ID="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id", ""))')"
+MODEL_USED="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model", "?/?"))')"
+COST="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cost", "?"))')"
 
-# ② 建会话
-SESSION_RAW=$(curl -sf --max-time 10 -u "$AUTH" -X POST "$ADDRESS/session" \
-    -H "Content-Type: application/json" \
-    -d "{\"title\":\"快速握手-$(date +%H%M%S)\"}" 2>&1)
-SESSION_ID=$(echo "$SESSION_RAW" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
-
-if [ -z "$SESSION_ID" ]; then
-    echo "  ❌ 会话创建失败"
-    exit 1
+if [ -n "$SESSION_ID" ]; then
+    echo "  ✓ 会话: $SESSION_ID"
 fi
-echo "  ✓ 会话: $SESSION_ID"
-
-# ③ 发消息 + 收回复
-MODEL_PROVIDER="${OPENCODE_PROVIDER:-zen}"
-MODEL_ID="${OPENCODE_MODEL:-deepseek-v4-flash-free}"
-
-RESP=$(curl -sf --max-time 120 -u "$AUTH" -X POST "$ADDRESS/session/$SESSION_ID/message" \
-    -H "Content-Type: application/json" \
-    -d "{\"model\":{\"providerID\":\"$MODEL_PROVIDER\",\"modelID\":\"$MODEL_ID\"},\"parts\":[{\"type\":\"text\",\"text\":\"$MESSAGE\"}],\"noReply\":false}" 2>&1)
-
-# 抽 text 回复
-REPLY=$(echo "$RESP" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for p in data.get('parts', []):
-    if p.get('type') == 'text':
-        print(p['text'])
-        break
-" 2>/dev/null || echo "(握手成功，回复解析异常)")
-
-COST=$(echo "$RESP" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-c = data.get('info',{}).get('cost', '?')
-print(c)
-" 2>/dev/null || echo "?")
-
-MODEL_USED=$(echo "$RESP" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-print('{}/{}'.format(
-    data.get('info',{}).get('providerID','?'),
-    data.get('info',{}).get('modelID','?')
-))
-" 2>/dev/null || echo "?/?")
-
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  📨 回复"
