@@ -206,15 +206,6 @@ agent-handshake/
     └── servers/           # 服务器记忆（gitignored，部署后自动生成）
 ```
 
-## 安装
-
-```bash
-# 从 GitHub 安装到本地 Skill 目录
-git clone https://github.com/lyliefeng/agent-handshake.git ~/.workbuddy/skills/agent-handshake
-
-# 或从 SkillHub / ClawHub 一键安装（即将上架）
-```
-
 ## 许可证
 
 MIT
