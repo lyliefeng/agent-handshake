@@ -8,6 +8,34 @@
 
 ---
 
+## 安装
+
+### 方式一：WorkBuddy 一句话安装（推荐）
+
+在 WorkBuddy 对话中直接说：
+
+```
+安装 agent-handshake 技能
+```
+
+系统将自动从推荐市场拉取并安装。
+
+### 方式二：GitHub 手动安装
+
+```bash
+git clone https://github.com/lyliefeng/agent-handshake.git ~/.workbuddy/skills/agent-handshake
+```
+
+### 方式三：URL 导入
+
+在 WorkBuddy 技能管理面板 → 点击 "通过 URL 导入" → 填入：
+
+```
+https://github.com/lyliefeng/agent-handshake
+```
+
+---
+
 ## 这是什么
 
 当你有多台服务器（NAS、VPS、云主机），每台都跑了 AI Agent（OpenCode、LangChain、CrewAI...），你需要一个统一的握手通道来发现它们、记住它们的身份、随时调用它们执行任务——**不需要 SSH**。
